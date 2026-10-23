@@ -12,8 +12,6 @@ Layout
             PPE you are enforcing
 
 Logging (only ever for people who are missing required PPE)
-    Auto   : a person with missing PPE who stands still for --still-seconds
-             (default 2s) is logged automatically.
     Manual : press "Capture Log" on a person's card.
     Each log is a JPG: the padded person crop on the left and a worn / missing
     checklist panel on the right. A row is also appended to logs/logs.csv.
@@ -29,7 +27,6 @@ to apply them. Confirming restarts the camera / detection pipeline.
 """
 import argparse
 import csv
-import math
 import os
 import queue
 import subprocess
@@ -349,16 +346,15 @@ def reset_tracker(model):
 # --------------------------------------------------------------------------- #
 # Shared settings (GUI thread writes, detector thread reads)
 # --------------------------------------------------------------------------- #
-Snapshot = namedtuple("Snapshot", "person ppe draw_ppe auto_log")
+Snapshot = namedtuple("Snapshot", "person ppe draw_ppe")
 
 
 class Settings:
-    def __init__(self, enabled_ppe, auto_log=True, person=True, draw_ppe=False):
+    def __init__(self, enabled_ppe, person=True, draw_ppe=False):
         self._lock = threading.Lock()
         self._person = person
         self._ppe = {key: key in enabled_ppe for key in PPE}
         self._draw_ppe = draw_ppe
-        self._auto_log = auto_log
 
     def set_person(self, on):
         with self._lock:
@@ -372,22 +368,12 @@ class Settings:
         with self._lock:
             self._draw_ppe = bool(on)
 
-    def set_auto_log(self, on):
-        with self._lock:
-            self._auto_log = bool(on)
-
-    @property
-    def auto_log(self):
-        with self._lock:
-            return self._auto_log
-
     def snapshot(self):
         with self._lock:
             return Snapshot(
                 self._person,
                 frozenset(k for k, on in self._ppe.items() if on),
                 self._draw_ppe,
-                self._auto_log,
             )
 
 
@@ -399,7 +385,6 @@ class PersonState:
     track_id: int
     box: Tuple[int, int, int, int]
     items: Dict[str, str]          # PPE key -> state, only for enforced items
-    still_for: float               # seconds standing still
     logged_at: Optional[str]       # "HH:MM:SS" if this violation was already logged
 
     @property
@@ -475,7 +460,7 @@ def _draw_icon(draw, cx, cy, state, th):
         draw.line([(cx - 6, cy), (cx + 6, cy)], fill=w, width=3)
 
 
-def build_report_image(frame, box, track_id, rows, theme="light", mode="auto"):
+def build_report_image(frame, box, track_id, rows, theme="light"):
     """Return a PIL image: padded person crop | white/black checklist panel."""
     th = THEMES[theme]
     fh, fw = frame.shape[:2]
@@ -524,7 +509,7 @@ def build_report_image(frame, box, track_id, rows, theme="light", mode="auto"):
         y += row_h
 
     _text(d, (x0 + pad, height - 32),
-          "Logged automatically" if mode == "auto" else "Captured manually",
+          "Captured manually",
           _font(16), th["muted"], "lm")
     return canvas
 
@@ -532,26 +517,18 @@ def build_report_image(frame, box, track_id, rows, theme="light", mode="auto"):
 class LogWriter:
     """Saves violation logs (image + CSV row) and remembers what was logged."""
 
-    def __init__(self, root, theme="light", cooldown=30.0):
+    def __init__(self, root, theme="light"):
         self.root = Path(root)
         self.image_dir = self.root / "images"
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.root / "logs.csv"
         self.theme = theme
-        self.cooldown = cooldown
         self.count = 0
         self._last = {}  # track_id -> (frozenset(missing), monotonic, "HH:MM:SS")
         self._lock = threading.Lock()
         if not self.csv_path.exists():
             with self.csv_path.open("w", newline="", encoding="utf-8-sig") as f:
                 csv.writer(f).writerow(["timestamp", "person_id", "mode", "missing_ppe", "image"])
-
-    def can_auto_log(self, track_id, missing_keys, now):
-        with self._lock:
-            prev = self._last.get(track_id)
-        if prev is None:
-            return True
-        return frozenset(missing_keys) != prev[0] or (now - prev[1]) >= self.cooldown
 
     def reset_memory(self):
         """Forget who was logged (track IDs restart after a camera restart)."""
@@ -566,10 +543,10 @@ class LogWriter:
             return prev[2]
         return None
 
-    def save(self, frame, track_id, box, rows, missing_keys, mode):
+    def save(self, frame, track_id, box, rows, missing_keys):
         stamp = datetime.now()
-        image = build_report_image(frame, box, track_id, rows, self.theme, mode)
-        path = self.image_dir / "{:%Y%m%d_%H%M%S}_person{}_{}.jpg".format(stamp, track_id, mode)
+        image = build_report_image(frame, box, track_id, rows, self.theme)
+        path = self.image_dir / "{:%Y%m%d_%H%M%S}_person{}.jpg".format(stamp, track_id)
         image.save(str(path), quality=92)
         missing_labels = [PPE[k]["label"] for k in missing_keys]
         with self._lock:
@@ -577,7 +554,7 @@ class LogWriter:
             self.count += 1
             with self.csv_path.open("a", newline="", encoding="utf-8-sig") as f:
                 csv.writer(f).writerow(
-                    [stamp.isoformat(timespec="seconds"), track_id, mode, "; ".join(missing_labels), str(path)])
+                    [stamp.isoformat(timespec="seconds"), track_id, "manual", "; ".join(missing_labels), str(path)])
         return path
 
 
@@ -727,7 +704,7 @@ class DetectionWorker(threading.Thread):
                 if frac >= 0.45 and (ii not in item_owner or frac > item_owner[ii][1]):
                     item_owner[ii] = (pi, frac)
 
-        absent, held, anchors, last_seen = ctx.absent, ctx.held, ctx.anchors, ctx.last_seen
+        absent, held, seen = ctx.absent, ctx.held, ctx.seen
         states = []
         for pi, person in enumerate(people):
             tid = person["track_id"]
@@ -755,36 +732,16 @@ class DetectionWorker(threading.Thread):
                 items[key] = state
             missing_keys = [k for k, s_ in items.items() if s_ == MISSING]
 
-            # standing-still timer: anchor moves only when the person really moves
-            foot = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)  # person centre
-            person_h = max(1.0, float(box[3] - box[1]))
-            anchor = anchors.get(tid)
-            if (anchor is None or now - last_seen.get(tid, now) > 1.0
-                    or math.hypot(foot[0] - anchor[0], foot[1] - anchor[1]) > args.still_tol * person_h):
-                anchor = (foot[0], foot[1], now)
-                anchors[tid] = anchor
-            last_seen[tid] = now
-            still_for = now - anchor[2]
-
-            if (snap.auto_log and missing_keys and still_for >= args.still_seconds
-                    and self.logger.can_auto_log(tid, missing_keys, now)):
-                try:
-                    ps = PersonState(tid, box, items, still_for, None)
-                    self.logger.save(frame, tid, box, ps.rows(), missing_keys, "auto")
-                    self.msgs.put(("log", "Auto-logged Person {} at {}".format(
-                        tid, datetime.now().strftime("%H:%M:%S"))))
-                except Exception as exc:
-                    self.msgs.put(("log", "Could not save log: {}".format(exc)))
+            seen[tid] = now
 
             logged_at = self.logger.logged_for(tid, missing_keys) if missing_keys else None
-            states.append(PersonState(tid, box, items, still_for, logged_at))
+            states.append(PersonState(tid, box, items, logged_at))
 
         ctx.n += 1
         if ctx.n % 60 == 0:  # forget tracks that disappeared
-            stale = {t for t, seen in last_seen.items() if now - seen > 10.0}
+            stale = {t for t, last in seen.items() if now - last > 10.0}
             for t in stale:
-                last_seen.pop(t, None)
-                anchors.pop(t, None)
+                seen.pop(t, None)
             for d in (absent, held):
                 for k in [k for k in d if k[0] in stale]:
                     d.pop(k, None)
@@ -801,7 +758,7 @@ class DetectionWorker(threading.Thread):
         failure = []
 
         def infer():
-            ctx = SimpleNamespace(absent=defaultdict(int), held={}, anchors={}, last_seen={}, n=0)
+            ctx = SimpleNamespace(absent=defaultdict(int), held={}, seen={}, n=0)
             rate, t_prev = 0.0, time.monotonic()
             try:
                 while not done.is_set() and not self.stop_event.is_set():
@@ -925,7 +882,7 @@ class PersonCard(ctk.CTkFrame):
             self._rows[key] = [icon, status, None]
         self._keys = tuple(keys)
 
-    def update_person(self, person, keys, auto_mode, still_seconds):
+    def update_person(self, person, keys):
         missing = person.missing
         n = len(missing)
         states = set(person.items.values())
@@ -940,18 +897,11 @@ class PersonCard(ctk.CTkFrame):
             badge = ("\u2714  Compliant", C.OK, C.OK_BG)
 
         note, note_color = "", C.MUTED
-        if n:
-            if person.logged_at:
-                note, note_color = "\u2714 Logged at {}".format(person.logged_at), C.OK
-            elif auto_mode:
-                if person.still_for < 0.3:
-                    note = "Waiting for them to stand still"
-                else:
-                    note = "Logging in {:.1f}s".format(max(0.0, still_seconds - person.still_for))
-                note_color = C.WARN
-        can_capture = (not auto_mode) and n > 0
+        if n and person.logged_at:
+            note, note_color = "\u2714 Logged at {}".format(person.logged_at), C.OK
+        can_capture = n > 0
 
-        sig = (tuple(keys), tuple(person.items.items()), badge, note, auto_mode, can_capture)
+        sig = (tuple(keys), tuple(person.items.items()), badge, note, can_capture)
         if sig == self._sig:
             return
         self._sig = sig
@@ -970,12 +920,8 @@ class PersonCard(ctk.CTkFrame):
         self.badge.configure(text=badge[0], text_color=badge[1], fg_color=badge[2])
         self.configure(border_color=C.BAD if n else C.BORDER)
         self.note.configure(text=note, text_color=note_color)
-        if auto_mode:
-            self.button.grid_remove()
-        else:
-            self.button.grid()
-            self.button.configure(state="normal" if can_capture else "disabled",
-                                  fg_color=C.ACCENT if can_capture else C.BORDER)
+        self.button.configure(state="normal" if can_capture else "disabled",
+                              fg_color=C.ACCENT if can_capture else C.BORDER)
 
 
 class App(ctk.CTk):
@@ -991,7 +937,7 @@ class App(ctk.CTk):
         self.minsize(1120, 700)
 
         enabled = set(PPE) if "all" in args.ppe else (set() if "none" in args.ppe else set(args.ppe))
-        self.settings = Settings(enabled, auto_log=(args.mode == "auto"), draw_ppe=args.draw_ppe)
+        self.settings = Settings(enabled, draw_ppe=args.draw_ppe)
         snap0 = self.settings.snapshot()
         # Requirements currently in effect. The switches are only a *pending* edit of this.
         self.applied = {"person": snap0.person}
@@ -999,7 +945,7 @@ class App(ctk.CTk):
         self.model_cache = {}
         self._restarting = False
         self._wait_id = None
-        self.logger = LogWriter(args.log_dir, theme=args.log_theme, cooldown=args.cooldown)
+        self.logger = LogWriter(args.log_dir, theme=args.log_theme)
         self.frames = queue.Queue(maxsize=1)
         self.msgs = queue.Queue()
         self.latest = None
@@ -1031,17 +977,6 @@ class App(ctk.CTk):
         ctk.CTkLabel(header, text=APP_NAME, font=FONTS.h1, text_color=C.TEXT).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(header, text="Model  \u00B7  {}".format(Path(self.args.model).stem),
                      font=FONTS.small, text_color=C.MUTED).grid(row=1, column=0, sticky="w")
-
-        mode_box = ctk.CTkFrame(header, fg_color="transparent")
-        mode_box.grid(row=0, column=2, rowspan=2, sticky="e")
-        ctk.CTkLabel(mode_box, text="Logging", font=FONTS.small, text_color=C.MUTED).grid(row=0, column=0, padx=(0, 10))
-        self.mode_btn = ctk.CTkSegmentedButton(
-            mode_box, values=["Auto", "Manual"], command=self._on_mode, font=FONTS.btn,
-            fg_color=C.SURFACE, selected_color=C.ACCENT, selected_hover_color=C.ACCENT_HOVER,
-            unselected_color=C.SURFACE, unselected_hover_color=C.SURFACE_2, text_color=C.TEXT,
-            height=34)
-        self.mode_btn.grid(row=0, column=1)
-        self.mode_btn.set("Auto" if self.settings.auto_log else "Manual")
 
         # Left: feed + requirements
         left = ctk.CTkFrame(self, fg_color="transparent")
@@ -1148,7 +1083,7 @@ class App(ctk.CTk):
         ctk.CTkButton(foot, text="Open logs", width=96, height=32, corner_radius=8, font=FONTS.btn,
                       fg_color=C.BORDER, hover_color="#363E4C", text_color=C.TEXT,
                       command=self._open_logs).grid(row=0, column=1, rowspan=2, padx=12)
-        self._update_hint()
+        self.hint.configure(text="Press Capture Log on a person with missing PPE.")
         self._set_empty(person_enabled=snap.person)
         self._relayout()
         self._refresh_pending()
@@ -1244,17 +1179,6 @@ class App(ctk.CTk):
     def _on_boxes(self):
         self.settings.set_draw_ppe(self.boxes_switch.get() == 1)
 
-    def _on_mode(self, value):
-        self.settings.set_auto_log(value == "Auto")
-        self._update_hint()
-
-    def _update_hint(self):
-        if self.settings.auto_log:
-            self.hint.configure(text="Auto: people missing PPE are logged after standing "
-                                     "still for {:.0f}s.".format(self.args.still_seconds))
-        else:
-            self.hint.configure(text="Manual: press Capture Log on a person with missing PPE.")
-
     def _open_logs(self):
         try:
             open_folder(self.logger.root.resolve())
@@ -1272,7 +1196,7 @@ class App(ctk.CTk):
             self._toast("Nothing to log for Person {}".format(track_id))
             return
         try:
-            self.logger.save(res.raw, person.track_id, person.box, person.rows(), person.missing, "manual")
+            self.logger.save(res.raw, person.track_id, person.box, person.rows(), person.missing)
             self._toast("Saved log for Person {} at {}".format(track_id, datetime.now().strftime("%H:%M:%S")))
         except Exception as exc:
             self._toast("Could not save log: {}".format(exc))
@@ -1311,8 +1235,6 @@ class App(ctk.CTk):
                 self.feed.configure(image="", text=payload, fg=C.BAD, justify="center")
                 self.live_label.configure(text="\u25CF  Stopped", text_color=C.BAD)
                 self.retry_btn.place(relx=0.5, rely=1.0, y=-24, anchor="s")
-            elif kind == "log":
-                self._toast(payload)
 
     def _apply_available(self, available):
         for key, sw in self.switches.items():
@@ -1346,7 +1268,6 @@ class App(ctk.CTk):
 
     def _update_people(self, res):
         now = time.monotonic()
-        auto = self.settings.auto_log
         layout_changed = False
 
         for person in res.people:
@@ -1356,7 +1277,7 @@ class App(ctk.CTk):
                 self.cards[person.track_id] = card
                 layout_changed = True
             self.last_seen[person.track_id] = now
-            card.update_person(person, res.active, auto, self.args.still_seconds)
+            card.update_person(person, res.active)
 
         present = {p.track_id for p in res.people}
         for tid in list(self.cards):
@@ -1416,7 +1337,7 @@ def parse_args(argv=None):
                         "SH17 release when --model is named {}).".format(MODEL_NAME))
     p.add_argument("--no-download", action="store_true",
                    help="Never download the model automatically.")
-    p.add_argument("--camera", type=int, default=1)
+    p.add_argument("--camera", type=int, default=0) #0=Laptop Camera, 1=External Camera
     p.add_argument("--confidence", type=float, default=0.30)
     p.add_argument("--imgsz", type=int, default=640,
                    help="Inference size. Lower = faster on CPU (320/416/480/640); small items need more.")
@@ -1432,15 +1353,8 @@ def parse_args(argv=None):
     p.add_argument("--ppe", nargs="+", default=["all"], choices=list(PPE) + ["all", "none"],
                    metavar="ITEM", help="PPE enforced at start-up (toggle live in the UI). "
                                         "Choices: {}, all, none.".format(", ".join(PPE)))
-    p.add_argument("--mode", choices=["auto", "manual"], default="manual", help="Initial logging mode.")
     p.add_argument("--miss-frames", type=int, default=0,
                    help="Detections (not video frames) an item must be absent before it counts as missing.")
-    p.add_argument("--still-seconds", type=float, default=2.0,
-                   help="Seconds a person must stand still before an auto-log.")
-    p.add_argument("--still-tol", type=float, default=0.12,
-                   help="Movement allowed while 'standing still', as a fraction of the person's height.")
-    p.add_argument("--cooldown", type=float, default=30.0,
-                   help="Seconds before the same unchanged violation can be auto-logged again.")
     p.add_argument("--log-dir", default="logs")
     p.add_argument("--log-theme", choices=["light", "dark"], default="dark",
                    help="Colour of the checklist panel in saved log images.")
