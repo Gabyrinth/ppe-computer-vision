@@ -63,7 +63,7 @@ MODEL_URL = "https://github.com/ahmadmughees/SH17dataset/releases/download/v1/yo
 # --------------------------------------------------------------------------- #
 # key -> label shown in the UI, accepted model class names (normalised), and
 # the body region needed to judge the item. A person cut off by the frame edge
-# is reported as "can't tell" instead of "missing" for head / feet items.
+# is reported as "can't tell" instead of "missing" for head items.
 PPE = {
     "helmet":   {"label": "Helmet",      "names": {"helmet"},                  "region": "head"},
     "mask":     {"label": "Face Mask",   "names": {"face mask medical", "face mask", "facemask", "mask"}, "region": "head"},
@@ -71,7 +71,6 @@ PPE = {
     "glasses":  {"label": "Glasses",     "names": {"glasses"},                  "region": "head"},
     "gloves":   {"label": "Gloves",      "names": {"gloves"},                   "region": "body"},
     "earmuffs": {"label": "Earmuffs",    "names": {"ear mufs", "ear muffs"},    "region": "head"},
-    "shoes":    {"label": "Shoes",       "names": {"shoes"},                    "region": "feet"},
 }
 PERSON_NAMES = {"person"}
 EDGE_MARGIN = 5  # px
@@ -172,7 +171,7 @@ NAME_TO_PPE = {norm(alias): key for key, spec in PPE.items() for alias in spec["
 
 # Fallback when a weights file spells a class slightly differently (e.g. "face-mask").
 PPE_KEYWORDS = (("mask", "mask"), ("muff", "earmuffs"), ("mufs", "earmuffs"), ("vest", "vest"),
-                ("glove", "gloves"), ("glass", "glasses"), ("helmet", "helmet"), ("shoe", "shoes"))
+                ("glove", "gloves"), ("glass", "glasses"), ("helmet", "helmet"))
 
 
 def ppe_key(label):
@@ -244,8 +243,6 @@ def person_region_visible(region, person_box, frame_height):
     _, y1, _, y2 = map(int, person_box)
     if region == "head":
         return y1 > EDGE_MARGIN
-    if region == "feet":
-        return y2 < frame_height - EDGE_MARGIN
     return True
 
 
@@ -718,7 +715,7 @@ class DetectionWorker(threading.Thread):
 
         people = suppress_overlaps(people_raw, iou_thresh=args.person_iou)
         ppe_items = []
-        for key in active:  # NMS per class so a glove never suppresses a shoe
+        for key in active:  # NMS per class so one item type never suppresses another
             ppe_items.extend(suppress_overlaps(
                 [d for d in ppe_raw if d["ppe"] == key], iou_thresh=args.ppe_iou))
 
@@ -759,7 +756,7 @@ class DetectionWorker(threading.Thread):
             missing_keys = [k for k, s_ in items.items() if s_ == MISSING]
 
             # standing-still timer: anchor moves only when the person really moves
-            foot = ((box[0] + box[2]) / 2.0, float(box[3]))
+            foot = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)  # person centre
             person_h = max(1.0, float(box[3] - box[1]))
             anchor = anchors.get(tid)
             if (anchor is None or now - last_seen.get(tid, now) > 1.0
@@ -1419,13 +1416,13 @@ def parse_args(argv=None):
                         "SH17 release when --model is named {}).".format(MODEL_NAME))
     p.add_argument("--no-download", action="store_true",
                    help="Never download the model automatically.")
-    p.add_argument("--camera", type=int, default=0)
-    p.add_argument("--confidence", type=float, default=0.35)
-    p.add_argument("--imgsz", type=int, default=736,
+    p.add_argument("--camera", type=int, default=1)
+    p.add_argument("--confidence", type=float, default=0.30)
+    p.add_argument("--imgsz", type=int, default=640,
                    help="Inference size. Lower = faster on CPU (320/416/480/640); small items need more.")
     p.add_argument("--device", default=None,
                    help="Inference device, e.g. cpu or 0 (NVIDIA GPU). Default: auto.")
-    p.add_argument("--class-conf", nargs="+", default=["gloves=0.15"], metavar="ITEM=VALUE",
+    p.add_argument("--class-conf", nargs="+", default=["gloves=0.10", "earmuffs=0.10", "mask=0.10"], metavar="ITEM=VALUE",
                    help="Per-PPE confidence overriding --confidence, e.g. gloves=0.20 glasses=0.25. "
                         "Default: gloves=0.20. Use 'none' to disable.")
     p.add_argument("--person-iou", type=float, default=0.55,
@@ -1436,7 +1433,7 @@ def parse_args(argv=None):
                    metavar="ITEM", help="PPE enforced at start-up (toggle live in the UI). "
                                         "Choices: {}, all, none.".format(", ".join(PPE)))
     p.add_argument("--mode", choices=["auto", "manual"], default="manual", help="Initial logging mode.")
-    p.add_argument("--miss-frames", type=int, default=2,
+    p.add_argument("--miss-frames", type=int, default=0,
                    help="Detections (not video frames) an item must be absent before it counts as missing.")
     p.add_argument("--still-seconds", type=float, default=2.0,
                    help="Seconds a person must stand still before an auto-log.")

@@ -1,2 +1,5 @@
 models/
 *.pt
+logs/
+*.jpg
+*.csv
