@@ -1,30 +1,3 @@
-"""
-PPE Monitor - construction-site PPE surveillance (SH17 / YOLOv9e + ByteTrack)
-with a CustomTkinter interface.
-
-Run from PowerShell or Command Prompt:
-    py -m pip install -r requirements.txt
-    py main.py --model models/sh17_yolov9e.pt
-
-Layout
-    left  : live camera feed + PPE requirement switches
-    right : one card per tracked person (scrollable) with a checklist of the
-            PPE you are enforcing
-
-Logging (only ever for people who are missing required PPE)
-    Manual : press "Capture Log" on a person's card.
-    Each log is a JPG: the padded person crop on the left and a worn / missing
-    checklist panel on the right. A row is also appended to logs/logs.csv.
-
-SH17 only has positive classes, so "missing" means the item was not found on
-that person for --miss-frames consecutive frames.
-
-Model: models/sh17_yolov9e.pt is downloaded automatically on first run (official
-SH17 release, CC BY-NC-SA 4.0) when it is not already present.
-
-Requirement switches are staged: flip them freely, then press "Confirm changes"
-to apply them. Confirming restarts the camera / detection pipeline.
-"""
 import argparse
 import csv
 import os
@@ -58,25 +31,22 @@ MODEL_URL = "https://github.com/ahmadmughees/SH17dataset/releases/download/v1/yo
 # --------------------------------------------------------------------------- #
 # PPE registry (SH17 class names)
 # --------------------------------------------------------------------------- #
-# key -> label shown in the UI, accepted model class names (normalised), and
-# the body region needed to judge the item. A person cut off by the frame edge
-# is reported as "can't tell" instead of "missing" for head items.
+# key -> label shown in the UI and the accepted model class names (normalised).
 PPE = {
-    "helmet":   {"label": "Helmet",      "names": {"helmet"},                  "region": "head"},
-    "mask":     {"label": "Face Mask",   "names": {"face mask medical", "face mask", "facemask", "mask"}, "region": "head"},
-    "vest":     {"label": "Safety Vest", "names": {"safety vest"},              "region": "body"},
-    "glasses":  {"label": "Glasses",     "names": {"glasses"},                  "region": "head"},
-    "gloves":   {"label": "Gloves",      "names": {"gloves"},                   "region": "body"},
-    "earmuffs": {"label": "Earmuffs",    "names": {"ear mufs", "ear muffs"},    "region": "head"},
+    "helmet":   {"label": "Helmet",      "names": {"helmet"}},
+    "mask":     {"label": "Face Mask",   "names": {"face mask medical", "face mask", "facemask", "mask"}},
+    "vest":     {"label": "Safety Vest", "names": {"safety vest"}},
+    "glasses":  {"label": "Glasses",     "names": {"glasses"}},
+    "gloves":   {"label": "Gloves",      "names": {"gloves"}},
+    "earmuffs": {"label": "Earmuffs",    "names": {"ear mufs", "ear muffs"}},
 }
 PERSON_NAMES = {"person"}
-EDGE_MARGIN = 5  # px
 
 # Per-person, per-item states
-WORN, MISSING, UNKNOWN, PENDING = "worn", "missing", "unknown", "pending"
+WORN, MISSING, PENDING = "worn", "missing", "pending"
 
 # --------------------------------------------------------------------------- #
-# Look & feel
+# Windows Color Schemes
 # --------------------------------------------------------------------------- #
 
 
@@ -104,13 +74,11 @@ PPE_BOX_BGR = (255, 141, 76)
 ROW_ICON = {
     WORN: ("\u2714", C.OK),
     MISSING: ("\u26A0", C.BAD),
-    UNKNOWN: ("\u2013", C.MUTED),
     PENDING: ("\u2026", C.MUTED),
 }
 ROW_TEXT = {
     WORN: ("Worn", C.OK),
     MISSING: ("Missing", C.BAD),
-    UNKNOWN: ("Can't tell", C.MUTED),
     PENDING: ("Checking", C.MUTED),
 }
 
@@ -134,6 +102,9 @@ def init_fonts():
 # --------------------------------------------------------------------------- #
 # Config / small helpers
 # --------------------------------------------------------------------------- #
+# Persistence: something already seen only needs this fraction of its normal confidence to stay.
+STAY_RATIO = 0.6
+
 BYTETRACK_YAML = """\
 # ByteTrack tracker configuration (Ultralytics)
 tracker_type: bytetrack
@@ -233,14 +204,6 @@ def overlap_fraction(person_box, item_box):
     iw = max(0, min(x2, c) - max(x1, a))
     ih = max(0, min(y2, d) - max(y1, b))
     return (iw * ih) / max(1, (c - a) * (d - b))
-
-
-def person_region_visible(region, person_box, frame_height):
-    """False when the body part needed for this item is cut off by the frame."""
-    _, y1, _, y2 = map(int, person_box)
-    if region == "head":
-        return y1 > EDGE_MARGIN
-    return True
 
 
 def parse_detections(result, names):
@@ -400,10 +363,8 @@ class FrameResult:
     raw: np.ndarray                # untouched frame (used for log crops)
     view: np.ndarray               # annotated frame for display
     people: List[PersonState]
-    fps: float
     person_enabled: bool
     active: List[str]              # enforced PPE keys, registry order
-    det_fps: float = 0.0           # how often the model actually runs (per second)
 
 
 # --------------------------------------------------------------------------- #
@@ -421,7 +382,7 @@ THEMES = {
                  line=(45, 52, 64), ok=(52, 211, 153), bad=(248, 113, 113),
                  bad_bg=(52, 26, 31), neutral=(107, 114, 128)),
 }
-LOG_STATE_TEXT = {WORN: "Worn", MISSING: "Missing", UNKNOWN: "Can't tell", PENDING: "Unchecked"}
+LOG_STATE_TEXT = {WORN: "Worn", MISSING: "Missing", PENDING: "Unchecked"}
 
 
 @lru_cache(maxsize=None)
@@ -669,18 +630,37 @@ class DetectionWorker(threading.Thread):
     def _analyse(self, frame, snap, available, model, tracker_file, ctx):
         """YOLO + ByteTrack on one frame -> per-person PPE states (runs in the inference thread)."""
         args = self.args
-        height, width = frame.shape[:2]
         active = [k for k in PPE if k in snap.ppe and k in available]
         now = time.monotonic()
 
-        floor = min([args.confidence] + list(args.class_conf.values()))
+        absent, held, seen = ctx.absent, ctx.held, ctx.seen
+        last_worn, last_state = ctx.last_worn, ctx.last_state
+
+        def enter_conf(label):
+            if is_person(label):
+                return args.person_conf
+            return args.class_conf.get(ppe_key(label), args.confidence)
+
+        # The model runs at the lowest "stay" level; what is kept depends on the item's history.
+        floor = max(0.05, min([args.confidence, args.person_conf]
+                              + list(args.class_conf.values())) * STAY_RATIO)
         kw = dict(source=frame, persist=True, tracker=tracker_file,
                   conf=floor, imgsz=args.imgsz, verbose=False)
         if args.device:
             kw["device"] = args.device
         result = model.track(**kw)[0]
-        detections = [d for d in parse_detections(result, model.names)
-                      if d["confidence"] >= args.class_conf.get(ppe_key(d["label"]), args.confidence)]
+
+        detections = []
+        for d in parse_detections(result, model.names):
+            need = enter_conf(d["label"])
+            if is_person(d["label"]):
+                tid = d["track_id"]
+                known = tid is not None and now - seen.get(tid, -1e9) < args.hold_seconds
+                if d["confidence"] >= (need * STAY_RATIO if known else need):
+                    detections.append(d)
+            elif d["confidence"] >= need * STAY_RATIO:
+                d["strong"] = d["confidence"] >= need   # weak ones only count if already worn
+                detections.append(d)
 
         people_raw = [d for d in detections if is_person(d["label"])] if snap.person else []
         ppe_raw = []
@@ -704,24 +684,52 @@ class DetectionWorker(threading.Thread):
                 if frac >= 0.45 and (ii not in item_owner or frac > item_owner[ii][1]):
                     item_owner[ii] = (pi, frac)
 
-        absent, held, seen = ctx.absent, ctx.held, ctx.seen
+        shown = {ii for ii, item in enumerate(ppe_items) if item["strong"]}
+
+        # A new tracker id on top of a person we just lost is almost always the same person:
+        # carry the item history over so nothing resets.
+        live_now = {p_["track_id"] for p_ in people if p_["track_id"] is not None}
+        for person in people:
+            tid = person["track_id"]
+            if tid is None or tid in seen:
+                continue
+            nbox = tuple(int(v) for v in person["box"])
+            for old, ghost in sorted(last_state.items(), key=lambda kv: -seen.get(kv[0], 0.0)):
+                if old in live_now or now - seen.get(old, -1e9) >= args.hold_seconds:
+                    continue
+                if (iou(ghost.box, nbox) > 0.30 or containment(ghost.box, nbox) >= 0.6
+                        or containment(nbox, ghost.box) >= 0.6):
+                    for key in active:
+                        for table in (held, last_worn, absent):
+                            if (old, key) in table:
+                                table[(tid, key)] = table[(old, key)]
+                    break
+
         states = []
         for pi, person in enumerate(people):
             tid = person["track_id"]
             if tid is None:
                 continue  # no stable identity -> can't list or debounce it
             box = tuple(int(v) for v in person["box"])
-            present = {ppe_items[ii]["ppe"] for ii, (owner, _) in item_owner.items() if owner == pi}
+
+            present = set()
+            for ii, (owner, _) in item_owner.items():
+                if owner != pi:
+                    continue
+                item = ppe_items[ii]
+                if item["strong"] or held.get((tid, item["ppe"])) == WORN:
+                    present.add(item["ppe"])
+                    shown.add(ii)
 
             items = {}
             for key in active:
                 k = (tid, key)
                 if key in present:
                     absent[k] = 0
+                    last_worn[k] = now
                     state = WORN
-                elif not person_region_visible(PPE[key]["region"], box, height):
-                    absent[k] = 0
-                    state = UNKNOWN
+                elif held.get(k) == WORN and now - last_worn.get(k, -1e9) < args.hold_seconds:
+                    state = WORN  # sticky: a worn item survives short detection gaps
                 else:
                     absent[k] += 1
                     if absent[k] >= args.miss_frames:
@@ -733,19 +741,35 @@ class DetectionWorker(threading.Thread):
             missing_keys = [k for k, s_ in items.items() if s_ == MISSING]
 
             seen[tid] = now
-
             logged_at = self.logger.logged_for(tid, missing_keys) if missing_keys else None
-            states.append(PersonState(tid, box, items, logged_at))
+            state_obj = PersonState(tid, box, items, logged_at)
+            states.append(state_obj)
+            last_state[tid] = state_obj
+
+        if snap.person:  # keep a person that was just lost, unless the same person came back as a new id
+            live_ids = {st.track_id for st in states}
+            for tid, ghost in sorted(last_state.items(), key=lambda kv: -seen.get(kv[0], 0.0)):
+                if tid in live_ids or now - seen.get(tid, -1e9) >= args.hold_seconds:
+                    continue
+                if any(iou(ghost.box, st.box) > 0.30
+                       or containment(ghost.box, st.box) >= 0.6
+                       or containment(st.box, ghost.box) >= 0.6 for st in states):
+                    continue
+                states.append(ghost)
+
+        ppe_shown = [ppe_items[ii] for ii in sorted(shown)]
 
         ctx.n += 1
         if ctx.n % 60 == 0:  # forget tracks that disappeared
             stale = {t for t, last in seen.items() if now - last > 10.0}
             for t in stale:
                 seen.pop(t, None)
-            for d in (absent, held):
+            for t in stale:
+                last_state.pop(t, None)
+            for d in (absent, held, last_worn):
                 for k in [k for k in d if k[0] in stale]:
                     d.pop(k, None)
-        return states, ppe_items, active
+        return states, ppe_shown, active
 
     def _frame_loop(self, cap, model, tracker_file, available):
         """Camera + drawing run at full speed here; the slow model runs in its own thread and
@@ -758,8 +782,8 @@ class DetectionWorker(threading.Thread):
         failure = []
 
         def infer():
-            ctx = SimpleNamespace(absent=defaultdict(int), held={}, seen={}, n=0)
-            rate, t_prev = 0.0, time.monotonic()
+            ctx = SimpleNamespace(absent=defaultdict(int), held={}, seen={}, last_worn={},
+                                  last_state={}, n=0)
             try:
                 while not done.is_set() and not self.stop_event.is_set():
                     if not wake.wait(0.1):
@@ -772,12 +796,8 @@ class DetectionWorker(threading.Thread):
                     snap = self.settings.snapshot()
                     states, ppe_items, active = self._analyse(
                         frame, snap, available, model, tracker_file, ctx)
-                    t = time.monotonic()
-                    inst = 1.0 / max(1e-6, t - t_prev)
-                    t_prev = t
-                    rate = inst if rate == 0.0 else 0.7 * rate + 0.3 * inst
                     with lock:
-                        latest["a"] = (states, ppe_items, active, rate)
+                        latest["a"] = (states, ppe_items, active)
                         latest["frame"] = frame
             except Exception as exc:
                 traceback.print_exc()
@@ -785,7 +805,6 @@ class DetectionWorker(threading.Thread):
 
         worker = threading.Thread(target=infer, daemon=True, name="inference")
         worker.start()
-        fps, t_prev = 0.0, time.monotonic()
         try:
             while not self.stop_event.is_set():
                 if failure:
@@ -800,9 +819,9 @@ class DetectionWorker(threading.Thread):
                     a, raw = latest["a"], latest["frame"]
                 snap = self.settings.snapshot()
                 active = [k for k in PPE if k in snap.ppe and k in available]
-                states, ppe_items, det_fps = [], [], 0.0
+                states, ppe_items = [], []
                 if a is not None:
-                    states, ppe_items, active, det_fps = a
+                    states, ppe_items, active = a
 
                 height, width = frame.shape[:2]
                 scale = max(0.6, min(width, height) / 720.0)
@@ -817,12 +836,8 @@ class DetectionWorker(threading.Thread):
                 for p in states:
                     draw_person(view, p.box, p.track_id, len(p.missing), scale)
 
-                t_now = time.monotonic()
-                inst = 1.0 / max(1e-6, t_now - t_prev)
-                t_prev = t_now
-                fps = inst if fps == 0.0 else 0.9 * fps + 0.1 * inst
                 put_latest(self.frames, FrameResult(
-                    raw if raw is not None else frame, view, states, fps, snap.person, active, det_fps))
+                    raw if raw is not None else frame, view, states, snap.person, active))
         finally:
             done.set()
             wake.set()
@@ -1249,9 +1264,7 @@ class App(ctk.CTk):
         self.latest = res
         self._have_frame = True
         self._show_frame(res.view)
-        self.live_label.configure(
-            text="\u25CF  LIVE  \u00B7  {:.0f} fps  \u00B7  detecting {:.1f}/s".format(res.fps, res.det_fps),
-            text_color=C.OK)
+        self.live_label.configure(text="\u25CF  LIVE", text_color=C.OK)
         self._update_people(res)
 
     def _show_frame(self, bgr):
@@ -1337,13 +1350,19 @@ def parse_args(argv=None):
                         "SH17 release when --model is named {}).".format(MODEL_NAME))
     p.add_argument("--no-download", action="store_true",
                    help="Never download the model automatically.")
-    p.add_argument("--camera", type=int, default=0) #0=Laptop Camera, 1=External Camera
+    p.add_argument("--camera", type=int, default=1)
     p.add_argument("--confidence", type=float, default=0.30)
     p.add_argument("--imgsz", type=int, default=640,
                    help="Inference size. Lower = faster on CPU (320/416/480/640); small items need more.")
     p.add_argument("--device", default=None,
                    help="Inference device, e.g. cpu or 0 (NVIDIA GPU). Default: auto.")
-    p.add_argument("--class-conf", nargs="+", default=["gloves=0.10", "earmuffs=0.10", "mask=0.10"], metavar="ITEM=VALUE",
+    p.add_argument("--hold-seconds", type=float, default=3.0,
+                   help="Persistence: how long a person or a worn item is kept after it was last "
+                        "detected, so brief misses do not make it flicker.")
+    p.add_argument("--person-conf", type=float, default=0.40,
+                   help="Confidence needed to count a PERSON (raise it if boxes appear on non-people "
+                        "or one person gets two boxes).")
+    p.add_argument("--class-conf", nargs="+", default=["gloves=0.10", "earmuffs=0.05", "mask=0.10"], metavar="ITEM=VALUE",
                    help="Per-PPE confidence overriding --confidence, e.g. gloves=0.20 glasses=0.25. "
                         "Default: gloves=0.20. Use 'none' to disable.")
     p.add_argument("--person-iou", type=float, default=0.55,
